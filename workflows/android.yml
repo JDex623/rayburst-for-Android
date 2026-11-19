@@ -1,0 +1,94 @@
+name: Android port audit and APK build
+on:
+  workflow_dispatch:
+    inputs:
+      build_apk:
+        description: 'Attempt Android APK build (requires porting completed)'
+        required: true
+        type: boolean
+        default: false
+  push:
+    paths:
+      - '.github/workflows/android.yml'
+      - 'scripts/android_audit.py'
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+  pull_request:
+    paths:
+      - '.github/workflows/android.yml'
+      - 'scripts/android_audit.py'
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Audit upstream mobile blockers
+        run: python scripts/android_audit.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rayburst-android-audit
+          path: android-audit.json
+  android-apk:
+    if: github.event_name == 'workflow_dispatch' && inputs.build_apk
+    needs: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK and NDK
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Initialize Android project if missing
+        run: |
+          if [ ! -d src-tauri/gen/android ]; then
+            pnpm exec tauri android init --ci
+          fi
+      - name: Set Android minimum SDK to 31
+        run: |
+          python - <<'PY2'
+          from pathlib import Path
+          p = Path('src-tauri/gen/android/app/build.gradle.kts')
+          if not p.exists():
+              raise SystemExit('Android Gradle config missing; check Tauri android init output')
+          import re
+          s = p.read_text()
+          s, count = re.subn(r'minSdk\s*=\s*\d+', 'minSdk = 31', s)
+          if count == 0:
+              raise SystemExit('Could not set minSdk in Android Gradle config')
+          p.write_text(s)
+          PY2
+      - name: Build ARM64 APK (will fail until Android engine port is ready)
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        run: pnpm exec tauri android build --apk --target aarch64
+      - name: Publish unsigned debug APK when build succeeds
+        uses: actions/upload-artifact@v4
+        with:
+          name: rayburst-android-arm64-apk
+          path: src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
